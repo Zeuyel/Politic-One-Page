@@ -1,0 +1,43 @@
+[keys]
+# 导航
+j = "next"           # 内置快捷（不在 keymap 中解析，用默认处理）
+k = "prev"           # 同上
+
+# 来源切换
+"1" = "toggle_source_sim"
+"2" = "toggle_source_real"
+"3" = "toggle_source_famous"
+
+# 题目显示：小写=仅当前题；大写=全局默认
+a = "toggle_answer_current"
+A = "toggle_answer_global"
+c = "toggle_comments_current"
+C = "toggle_comments_global"
+
+# 标记状态
+n = "mark_new"
+r = "mark_reviewing"
+m = "mark_mastered"
+
+# 评分（考前冲刺）
+z = "grade_again"
+x = "grade_hard"
+g = "grade_good"
+v = "grade_easy"
+
+# 视图
+D = "toggle_due_only"
+R = "reload"
+
+# Visual 模式（类似 Vim）
+v = "visual_toggle"
+V = "visual_line_toggle"
+h = "left"
+l = "right"
+j = "down_detail"
+k = "up_detail"
+y = "yank_to_note"
+
+# 焦点切换
+enter = "enter_text"
+esc = "exit_text"
