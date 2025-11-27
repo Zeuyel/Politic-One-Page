@@ -1,0 +1,11 @@
+.env
+# Rust / cargo 构建产物
+target/
+**/target/
+
+# Python / venv 临时目录
+**/venv/
+
+# 其它常见编译产物
+*.pyc
+*.log

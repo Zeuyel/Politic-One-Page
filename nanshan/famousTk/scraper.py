@@ -3,11 +3,25 @@ import json
 import time
 import os
 
+def load_env():
+    """Simple .env loader to avoid dependencies."""
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+    if os.path.exists(env_path):
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    parts = line.split('=', 1)
+                    if len(parts) == 2:
+                        os.environ[parts[0].strip()] = parts[1].strip()
+
+load_env()
+
 # Base URL and headers from prd.md
 BASE_URL = "https://52kaoyan.top/api/v1"
 HEADERS = {
     "Host": "52kaoyan.top",
-    "Authorization": "Bearer *****"
+    "Authorization": f"Bearer {os.environ.get('TOKEN', '')}",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
 CLASS_ID = 25705
