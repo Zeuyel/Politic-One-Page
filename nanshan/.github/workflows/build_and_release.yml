@@ -1,0 +1,76 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Check + Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run fmt check
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo check
+        run: cargo check
+
+  release:
+    name: Build release artifact
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package binary
+        run: |
+          mkdir -p release
+          cp target/release/errortk-tui release/
+          tar -czf release/errortk-tui-${{ github.event.release.tag_name }}.tar.gz -C release errortk-tui
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v3
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: release/errortk-tui-${{ github.event.release.tag_name }}.tar.gz
+          asset_name: errortk-tui-${{ github.event.release.tag_name }}.tar.gz
+          asset_content_type: application/gzip

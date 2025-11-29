@@ -5,7 +5,13 @@
 // - 列表 + 右侧详情（内容/答案/解析/评论可切换显示）
 // - 在界面内将题目标注 new/reviewing/mastered，并回写 JSON
 
-use std::{cmp::min, fs, io, path::PathBuf, time::Duration};
+use std::{
+    cmp::min,
+    fs, io,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -32,7 +38,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tui_textarea::{CursorMove, Scrolling, TextArea};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum SourceKind {
@@ -115,6 +121,8 @@ struct Question {
     source: Option<String>,
     #[serde(default)]
     exam: Option<ExamState>,
+    #[serde(default)]
+    exam_by_cloze: HashMap<String, ExamState>,
 }
 
 fn default_status() -> String {
@@ -183,9 +191,12 @@ struct App {
     filtered_note_indices: Vec<usize>,
     note_indent_levels: Vec<usize>,
     note_fold_mode: NotesFoldMode,
+    question_search_query: Option<String>,
+    question_search_active: bool,
+    question_filtered_indices: Vec<usize>,
     // flashcards
     flash_mode: bool,
-    flash_cards: Vec<(usize, String)>, // (note_index, cloze idx like "c1")
+    flash_cards: Vec<FlashCardSource>,
     flash_pos: usize,
     flash_revealed: bool,
 }
@@ -237,6 +248,9 @@ impl App {
             filtered_note_indices: Vec::new(),
             note_indent_levels: Vec::new(),
             note_fold_mode: NotesFoldMode::Full,
+            question_search_query: None,
+            question_search_active: false,
+            question_filtered_indices: Vec::new(),
             flash_mode: false,
             flash_cards: Vec::new(),
             flash_pos: 0,
@@ -323,6 +337,7 @@ impl App {
         } else if self.list_state.selected().is_none() {
             self.list_state.select(Some(0));
         }
+        refresh_question_filter(self);
     }
 
     fn get_question_mut(&mut self, r: &RowRef) -> &mut Question {
@@ -342,7 +357,13 @@ impl App {
     }
 
     fn selected_ref(&self) -> Option<&RowRef> {
-        self.list_state.selected().and_then(|i| self.rows.get(i))
+        let selected = self.list_state.selected()?;
+        let idx = if self.question_search_active {
+            self.question_filtered_indices.get(selected).copied()
+        } else {
+            Some(selected)
+        }?;
+        self.rows.get(idx)
     }
 
     fn status_counts(&self) -> (usize, usize, usize) {
@@ -692,10 +713,12 @@ fn handle_key(app: &mut App, key: KeyEvent, data_path: &PathBuf) -> Result<bool>
         }
         KeyCode::Down => match app.left_panel {
             LeftPanel::Questions => {
-                if let Some(sel) = app.list_state.selected() {
-                    let n = app.rows.len();
-                    if n > 0 {
+                let n = question_visible_count(app);
+                if n > 0 {
+                    if let Some(sel) = app.list_state.selected() {
                         app.list_state.select(Some(min(sel + 1, n - 1)));
+                    } else {
+                        app.list_state.select(Some(0));
                     }
                 }
             }
@@ -715,6 +738,10 @@ fn handle_key(app: &mut App, key: KeyEvent, data_path: &PathBuf) -> Result<bool>
             if app.note_search_active && matches!(app.left_panel, LeftPanel::Notes) {
                 app.note_search_active = false;
                 rebuild_note_view(app);
+            } else if app.question_search_active && matches!(app.left_panel, LeftPanel::Questions) {
+                app.question_search_active = false;
+                app.question_search_query = None;
+                refresh_question_filter(app);
             } else {
                 match app.left_panel {
                     LeftPanel::Questions => apply_action(app, data_path, KeyAction::EnterText)?,
@@ -727,6 +754,10 @@ fn handle_key(app: &mut App, key: KeyEvent, data_path: &PathBuf) -> Result<bool>
                 app.note_search_active = false;
                 app.note_search_query = None;
                 rebuild_note_view(app);
+            } else if app.question_search_active && matches!(app.left_panel, LeftPanel::Questions) {
+                app.question_search_active = false;
+                app.question_search_query = None;
+                refresh_question_filter(app);
             } else {
                 apply_action(app, data_path, KeyAction::ExitText)?;
             }
@@ -745,6 +776,10 @@ fn handle_key(app: &mut App, key: KeyEvent, data_path: &PathBuf) -> Result<bool>
                 app.note_search_active = true;
                 app.note_search_query = Some(String::new());
                 rebuild_note_view(app);
+            } else if matches!(app.left_panel, LeftPanel::Questions) {
+                app.question_search_active = true;
+                app.question_search_query = Some(String::new());
+                refresh_question_filter(app);
             }
         }
         KeyCode::Char('j') => {
@@ -763,12 +798,12 @@ fn handle_key(app: &mut App, key: KeyEvent, data_path: &PathBuf) -> Result<bool>
                     }
                 }
             } else if matches!(app.left_panel, LeftPanel::Questions) {
+                let n = question_visible_count(app);
                 if let Some(sel) = app.list_state.selected() {
-                    let n = app.rows.len();
                     if n > 0 {
                         app.list_state.select(Some(min(sel + 1, n - 1)));
                     }
-                } else if !app.rows.is_empty() {
+                } else if n > 0 {
                     app.list_state.select(Some(0));
                 }
             } else if matches!(app.left_panel, LeftPanel::Notes) {
@@ -790,11 +825,12 @@ fn handle_key(app: &mut App, key: KeyEvent, data_path: &PathBuf) -> Result<bool>
                     }
                 }
             } else if matches!(app.left_panel, LeftPanel::Questions) {
+                let n = question_visible_count(app);
                 if let Some(sel) = app.list_state.selected() {
                     if sel > 0 {
                         app.list_state.select(Some(sel - 1));
                     }
-                } else if !app.rows.is_empty() {
+                } else if n > 0 {
                     app.list_state.select(Some(0));
                 }
             } else if matches!(app.left_panel, LeftPanel::Notes) {
@@ -824,15 +860,7 @@ fn handle_key(app: &mut App, key: KeyEvent, data_path: &PathBuf) -> Result<bool>
         }
         // handled above in unconditional 'j'/'k'
         KeyCode::Char('v') if app.flash_mode => {
-            flash_grade(app, "easy")?;
-        }
-        KeyCode::Char('v') => {
-            if app.focus == Focus::Text {
-                app.mode = Mode::Visual;
-                app.visual_kind = VisualKind::Char;
-                app.sel_start = Some((app.cursor_line, app.cursor_col));
-                app.textarea.start_selection();
-            }
+            flash_grade(app, data_path, "easy")?;
         }
         KeyCode::Char('V') => {
             if app.focus == Focus::Text {
@@ -871,19 +899,35 @@ fn handle_key(app: &mut App, key: KeyEvent, data_path: &PathBuf) -> Result<bool>
             flash_prev(app);
         }
         KeyCode::Char('z') if app.flash_mode => {
-            flash_grade(app, "again")?;
+            flash_grade(app, data_path, "again")?;
         }
         KeyCode::Char('x') if app.flash_mode => {
-            flash_grade(app, "hard")?;
+            flash_grade(app, data_path, "hard")?;
         }
         KeyCode::Char('g') if app.flash_mode => {
-            flash_grade(app, "good")?;
+            flash_grade(app, data_path, "good")?;
+        }
+        KeyCode::Char('v') if app.flash_mode => {
+            flash_grade(app, data_path, "easy")?;
+        }
+        KeyCode::Char('v') => {
+            if app.focus == Focus::Text {
+                app.mode = Mode::Visual;
+                app.visual_kind = VisualKind::Char;
+                app.sel_start = Some((app.cursor_line, app.cursor_col));
+                app.textarea.start_selection();
+            }
         }
         KeyCode::Char(ch) => {
             if app.note_search_active && matches!(app.left_panel, LeftPanel::Notes) {
                 let s = app.note_search_query.get_or_insert(String::new());
                 s.push(ch);
                 rebuild_note_view(app);
+                return Ok(false);
+            } else if app.question_search_active && matches!(app.left_panel, LeftPanel::Questions) {
+                let s = app.question_search_query.get_or_insert(String::new());
+                s.push(ch);
+                refresh_question_filter(app);
                 return Ok(false);
             }
             if let Some(action) = app.keymap.get(&ch).cloned() {
@@ -896,6 +940,11 @@ fn handle_key(app: &mut App, key: KeyEvent, data_path: &PathBuf) -> Result<bool>
                     s.pop();
                 }
                 rebuild_note_view(app);
+            } else if app.question_search_active && matches!(app.left_panel, LeftPanel::Questions) {
+                if let Some(s) = app.question_search_query.as_mut() {
+                    s.pop();
+                }
+                refresh_question_filter(app);
             }
         }
         // Flashcards 快捷键
@@ -937,6 +986,7 @@ enum KeyAction {
     ResizeLeftShrink,
     ResizeLeftExpand,
     ToggleNotesFold,
+    RunScraper,
     NoteOpen,
     NoteEdit,
     NoteDelete,
@@ -1031,6 +1081,7 @@ fn apply_action(app: &mut App, data_path: &PathBuf, action: KeyAction) -> Result
         KeyAction::ResizeLeftShrink => resize_left(app, -5),
         KeyAction::ResizeLeftExpand => resize_left(app, 5),
         KeyAction::ToggleNotesFold => toggle_notes_fold(app),
+        KeyAction::RunScraper => run_scraper(app, data_path)?,
         KeyAction::NoteOpen => note_open_right(app),
         KeyAction::NoteEdit => note_edit(app),
         KeyAction::NoteDelete => note_delete(app)?,
@@ -1189,7 +1240,10 @@ fn exit_text_focus(app: &mut App) {
     app.focus = Focus::List;
     app.mode = Mode::Normal;
     app.sel_start = None;
+    app.cursor_line = 0;
+    app.cursor_col = 0;
     app.content_offset = 0;
+    app.right_scroll = 0;
 }
 
 fn move_cursor(app: &mut App, dline: isize, dcol: isize) {
@@ -1396,6 +1450,7 @@ fn switch_left_panel(app: &mut App) {
             if app.list_state.selected().is_none() && !app.rows.is_empty() {
                 app.list_state.select(Some(0));
             }
+            refresh_question_filter(app);
         }
     }
 }
@@ -1486,7 +1541,13 @@ fn grade_note(app: &mut App, grade: &str) -> Result<()> {
 
 // ------------- Flashcards -------------
 fn flash_start(app: &mut App) {
-    // 从 Notes 面板当前笔记生成卡片（按 cN）
+    match app.left_panel {
+        LeftPanel::Notes => flash_start_notes(app),
+        LeftPanel::Questions => flash_start_question(app),
+    }
+}
+
+fn flash_start_notes(app: &mut App) {
     if let Some(idx) = current_note_index(app) {
         if let Some(n) = app.notes.data.notes.get(idx) {
             let clozes = parse_clozes(&n.content);
@@ -1497,7 +1558,10 @@ fn flash_start(app: &mut App) {
             let mut seen = std::collections::HashSet::new();
             for c in clozes {
                 if seen.insert(c.idx.clone()) {
-                    cards.push((idx, c.idx));
+                    cards.push(FlashCardSource::Note {
+                        note_idx: idx,
+                        cloze: c.idx,
+                    });
                 }
             }
             app.flash_cards = cards;
@@ -1505,6 +1569,60 @@ fn flash_start(app: &mut App) {
             app.flash_revealed = false;
             app.flash_mode = true;
         }
+    }
+}
+
+fn flash_start_question(app: &mut App) {
+    if let Some(rr) = app.selected_ref() {
+        let q = app.get_question(rr);
+        if q.answer.is_empty() {
+            return;
+        }
+        let mut cards = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let answers: Vec<String> = q
+            .answer
+            .iter()
+            .filter_map(|ans| {
+                let trimmed = ans.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(ans.clone())
+                }
+            })
+            .collect();
+        if answers.is_empty() {
+            return;
+        }
+        if answers.len() > 1 {
+            let cloze = "multi".to_string();
+            if seen.insert(cloze.clone()) {
+                cards.push(FlashCardSource::Question {
+                    row: rr.clone(),
+                    cloze,
+                    answers: answers.clone(),
+                    is_multi: true,
+                });
+            }
+        } else {
+            let cloze = "a1".to_string();
+            if seen.insert(cloze.clone()) {
+                cards.push(FlashCardSource::Question {
+                    row: rr.clone(),
+                    cloze,
+                    answers: answers.clone(),
+                    is_multi: false,
+                });
+            }
+        }
+        if cards.is_empty() {
+            return;
+        }
+        app.flash_cards = cards;
+        app.flash_pos = 0;
+        app.flash_revealed = false;
+        app.flash_mode = true;
     }
 }
 
@@ -1530,36 +1648,61 @@ fn flash_prev(app: &mut App) {
     }
 }
 
+#[derive(Debug, Clone)]
+enum FlashCardSource {
+    Note {
+        note_idx: usize,
+        cloze: String,
+    },
+    Question {
+        row: RowRef,
+        cloze: String,
+        answers: Vec<String>,
+        is_multi: bool,
+    },
+}
+
 fn flash_toggle(app: &mut App) {
     if app.flash_mode {
         app.flash_mode = false;
         app.flash_revealed = false;
-    } else if matches!(app.left_panel, LeftPanel::Notes) {
+    } else {
         flash_start(app);
     }
 }
 
-fn flash_grade(app: &mut App, grade: &str) -> Result<()> {
-    if !app.flash_mode {
+fn flash_grade(app: &mut App, data_path: &PathBuf, grade: &str) -> Result<()> {
+    if !app.flash_mode || app.flash_cards.is_empty() {
         return Ok(());
     }
-    if app.flash_cards.is_empty() {
-        return Ok(());
-    }
-    let (note_idx, cloze_idx) = &app.flash_cards[app.flash_pos];
-    if let Some(note) = app.notes.data.notes.get_mut(*note_idx) {
-        let entry = note
-            .exam_by_cloze
-            .entry(cloze_idx.clone())
-            .or_insert_with(default_exam_state);
-        apply_exam_grade(entry, grade, None);
-        note.updated_at = Utc::now().to_rfc3339();
-        app.notes.save()?;
-        if !app.flash_cards.is_empty() {
-            app.flash_pos = (app.flash_pos + 1) % app.flash_cards.len();
+    let card = app.flash_cards[app.flash_pos].clone();
+    match card {
+        FlashCardSource::Note { note_idx, cloze } => {
+            if let Some(note) = app.notes.data.notes.get_mut(note_idx) {
+                let entry = note
+                    .exam_by_cloze
+                    .entry(cloze.clone())
+                    .or_insert_with(default_exam_state);
+                apply_exam_grade(entry, grade, None);
+                note.updated_at = Utc::now().to_rfc3339();
+                app.notes.save()?;
+            }
         }
-        app.flash_revealed = false;
+        FlashCardSource::Question { ref row, cloze, .. } => {
+            grade_and_schedule(app, data_path, grade)?;
+            let exam_date = app.exam_date;
+            let q = app.get_question_mut(row);
+            let entry = q
+                .exam_by_cloze
+                .entry(cloze.clone())
+                .or_insert_with(default_exam_state);
+            apply_exam_grade(entry, grade, exam_date);
+        }
     }
+    if !app.flash_cards.is_empty() {
+        app.flash_pos = (app.flash_pos + 1) % app.flash_cards.len();
+    }
+    app.flash_revealed = false;
     Ok(())
 }
 
@@ -1571,6 +1714,21 @@ fn set_status_and_save(app: &mut App, data_path: &PathBuf, status: &str) -> Resu
         q.last_reviewed = Some(Utc::now().to_rfc3339());
         save_data(data_path, &app.data)?;
     }
+    Ok(())
+}
+
+fn run_scraper(app: &mut App, data_path: &PathBuf) -> Result<()> {
+    let scraper = Path::new("../backend/scraper.py");
+    let status = Command::new("python3")
+        .arg(scraper)
+        .status()
+        .with_context(|| format!("执行 scraper 失败: {}", scraper.display()))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("scraper 返回非 0 退出码"));
+    }
+    let d = load_data(data_path)?;
+    app.data = d;
+    app.rebuild_rows();
     Ok(())
 }
 
@@ -1641,28 +1799,94 @@ fn draw_flashcard_fullscreen(f: &mut Frame, app: &mut App) {
     if app.flash_cards.is_empty() {
         return;
     }
-    let (note_idx, ref clz) = app.flash_cards[app.flash_pos];
-    if let Some(n) = app.notes.data.notes.get(note_idx) {
-        let masked = mask_cloze(&n.content, clz, app.flash_revealed);
-        let header = format!(
-            "{} · {} ({}/{})",
-            note_display_title(n),
-            clz,
-            app.flash_pos + 1,
-            app.flash_cards.len()
-        );
-        let full = format!("{}\n\n{}", header, masked);
-        let text = Paragraph::new(full)
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(th.fg));
-        let inner = Rect {
-            x: area.x + 1,
-            y: area.y + 1,
-            width: area.width.saturating_sub(2),
-            height: area.height.saturating_sub(2),
-        };
-        f.render_widget(text, inner);
-    }
+    let card = &app.flash_cards[app.flash_pos];
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let (notes, single, multi) = flashcard_counts(app);
+    let stats_line = Line::from(vec![
+        Span::styled(format!("[New:{}] ", notes), Style::default().fg(th.info)),
+        Span::styled(
+            format!("[Learning:{}] ", single),
+            Style::default().fg(th.good),
+        ),
+        Span::styled(format!("[Review:{}]", multi), Style::default().fg(th.warn)),
+    ]);
+    let body_lines = match card {
+        FlashCardSource::Note { note_idx, cloze } => {
+            if let Some(n) = app.notes.data.notes.get(*note_idx) {
+                let masked = mask_cloze(&n.content, cloze, app.flash_revealed);
+                let header = format!(
+                    "{} · {} ({}/{})",
+                    note_display_title(n),
+                    cloze,
+                    app.flash_pos + 1,
+                    app.flash_cards.len(),
+                );
+                vec![
+                    Line::from(Span::styled(header, Style::default().fg(th.fg))),
+                    Line::from(Span::raw(" ")),
+                    Line::from(Span::raw(masked)),
+                ]
+            } else {
+                vec![Line::from(Span::styled(
+                    format!(
+                        "笔记已失效 ({}/{})",
+                        app.flash_pos + 1,
+                        app.flash_cards.len()
+                    ),
+                    Style::default().fg(th.muted),
+                ))]
+            }
+        }
+        FlashCardSource::Question {
+            row,
+            cloze,
+            answers,
+            is_multi,
+        } => {
+            let q = app.get_question(row);
+            let prompt = if app.flash_revealed {
+                format!("{}\n\n答案: {}", q.content, answers.join(" | "))
+            } else {
+                format!("{}\n\n答案: [···]", q.content)
+            };
+            let label = if *is_multi {
+                "【多选题】".to_string()
+            } else {
+                format!("{}", cloze)
+            };
+            let options = format_question_options(q);
+            let schedule = format_question_schedule(q);
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    format!(
+                        "qid:{} {} · {}/{}",
+                        q.id,
+                        label,
+                        answers.len(),
+                        answers.len().max(1)
+                    ),
+                    Style::default().fg(th.fg),
+                )),
+                Line::from(Span::styled(schedule, Style::default().fg(th.muted))),
+            ];
+            if !options.is_empty() {
+                lines.push(Line::from(Span::raw(options)));
+            }
+            lines.push(Line::from(Span::raw(prompt)));
+            lines
+        }
+    };
+    let mut all_lines = vec![stats_line];
+    all_lines.extend(body_lines);
+    let para = Paragraph::new(all_lines)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(th.fg));
+    f.render_widget(para, inner);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1687,10 +1911,14 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
     let th = app.theme;
-    // 先提取为拥有所有权的数据，避免借用 app 贯穿到渲染阶段
-    let rows_owned: Vec<(i64, String, String, String, String)> = app
-        .rows
+    let visible_rows: Vec<&RowRef> = app
+        .question_filtered_indices
         .iter()
+        .filter_map(|&idx| app.rows.get(idx))
+        .collect();
+
+    let items: Vec<ListItem> = visible_rows
+        .into_iter()
         .map(|rr| {
             let q = app.get_question(rr);
             let id = q.id;
@@ -1698,13 +1926,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
             let origin = q.origin_name.clone();
             let sub = q.sub_name.clone();
             let status = q.user_status.clone();
-            (id, src, origin, sub, status)
-        })
-        .collect();
-
-    let items: Vec<ListItem> = rows_owned
-        .into_iter()
-        .map(|(id, src, origin, sub, status)| {
+            let mut spans = Vec::new();
             let icon = match status.as_str() {
                 "mastered" => "✅",
                 "reviewing" => "🔄",
@@ -1720,19 +1942,26 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
                 "reviewing" => th.warn,
                 _ => th.muted,
             };
-            let line = Line::from(vec![
-                Span::styled("› ", Style::default().fg(th.accent)),
-                Span::raw(icon),
-                Span::styled(format!(" {:>6}  ", id), Style::default().fg(th.muted)),
-                Span::styled(format!(" {} ", src), Style::default().fg(src_color)),
-                Span::styled(" | ", Style::default().fg(th.muted)),
-                Span::styled(origin, Style::default().fg(th.fg)),
-                Span::raw(" - "),
-                Span::styled(sub, Style::default().fg(th.muted)),
-                Span::styled("  ", Style::default()),
-                Span::styled(status, Style::default().fg(status_color)),
-            ]);
-            ListItem::new(line)
+            spans.push(Span::styled("› ", Style::default().fg(th.accent)));
+            spans.push(Span::raw(icon));
+            spans.push(Span::styled(
+                format!(" {:>6}  ", id),
+                Style::default().fg(th.muted),
+            ));
+            spans.push(Span::styled(
+                format!(" {} ", src),
+                Style::default().fg(src_color),
+            ));
+            spans.push(Span::styled(" | ", Style::default().fg(th.muted)));
+            spans.push(Span::styled(origin, Style::default().fg(th.fg)));
+            spans.push(Span::raw(" - "));
+            spans.push(Span::styled(sub, Style::default().fg(th.muted)));
+            spans.push(Span::styled("  ", Style::default()));
+            spans.push(Span::styled(status, Style::default().fg(status_color)));
+            if q.answer.len() > 1 {
+                spans.push(Span::styled("  【多选题】", Style::default().fg(th.warn)));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -1842,6 +2071,12 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &mut App) {
                 "题干:",
                 Style::default().add_modifier(Modifier::BOLD).fg(th.info),
             )));
+            if q.answer.len() > 1 {
+                lines.push(Line::from(Span::styled(
+                    "【多选题】",
+                    Style::default().fg(th.warn),
+                )));
+            }
             lines.push(Line::from(Span::raw(q.content.clone())));
             lines.push(Line::from(" "));
             if !q.options.is_empty() {
@@ -1897,7 +2132,9 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &mut App) {
         app.right_viewport = viewport;
     }
     if matches!(app.focus, Focus::Text) {
-        let content_len = apply_textarea_scroll(app, area);
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let (wrapped_lines, row_counts) = wrap_flat_lines(&app.flat_lines, inner_width);
+        app.textarea = TextArea::from(wrapped_lines);
         app.textarea.set_block(
             ratatui::widgets::block::Block::default()
                 .title(Span::styled(
@@ -1907,6 +2144,12 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(th.muted)),
         );
+        app.textarea.set_cursor_line_style(Style::default());
+        app.textarea
+            .set_cursor_style(Style::default().bg(app.theme.accent).fg(Color::Black));
+        app.textarea
+            .set_selection_style(Style::default().bg(app.theme.selection_bg));
+        let content_len = apply_textarea_scroll(app, &row_counts, inner_width);
         f.render_widget(&app.textarea, area);
         draw_scrollbar(f, area, app.right_scroll, content_len);
         return;
@@ -1937,23 +2180,12 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-fn apply_textarea_scroll(app: &mut App, area: Rect) -> usize {
-    let maxw = area.width.saturating_sub(2) as usize;
+fn apply_textarea_scroll(app: &mut App, row_counts: &[usize], maxw: usize) -> usize {
+    let width = maxw.max(1);
     let vp = app.right_viewport.max(1);
-    let mut total_display = 0usize;
-    let mut cursor_display_base = 0usize;
-    for (idx, s) in app.flat_lines.iter().enumerate() {
-        let w = UnicodeWidthStr::width(s.as_str());
-        let rows = if maxw == 0 {
-            1
-        } else {
-            ((w + maxw - 1) / maxw).max(1)
-        };
-        if idx < app.cursor_line {
-            cursor_display_base += rows;
-        }
-        total_display += rows;
-    }
+    let total_display: usize = row_counts.iter().sum();
+    let cursor_line = app.cursor_line.min(row_counts.len().saturating_sub(1));
+    let cursor_display_base: usize = row_counts.iter().take(cursor_line).sum();
     let cur_text = app
         .flat_lines
         .get(app.cursor_line)
@@ -1963,7 +2195,7 @@ fn apply_textarea_scroll(app: &mut App, area: Rect) -> usize {
     let mut tmp = String::new();
     tmp.extend(cur_text.chars().take(take_cols));
     let cur_col_w = UnicodeWidthStr::width(tmp.as_str());
-    let intra = if maxw == 0 { 0 } else { cur_col_w / maxw };
+    let intra = cur_col_w / width;
     let anchor = app.content_offset + cursor_display_base + intra;
     let mut max_top = app.content_offset + total_display;
     max_top = max_top.saturating_sub(vp);
@@ -1994,6 +2226,108 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, position: usize, content_len: usize
         height: area.height.saturating_sub(2),
     };
     f.render_stateful_widget(sb, sb_area, &mut state);
+}
+
+fn flashcard_counts(app: &App) -> (usize, usize, usize) {
+    let mut new = 0usize;
+    let mut learning = 0usize;
+    let mut review = 0usize;
+    for card in &app.flash_cards {
+        match card {
+            FlashCardSource::Note { note_idx, cloze } => {
+                if let Some(note) = app.notes.data.notes.get(*note_idx) {
+                    match card_phase(note.exam_by_cloze.get(cloze)) {
+                        FlashCardPhase::New => new += 1,
+                        FlashCardPhase::Learning => learning += 1,
+                        FlashCardPhase::Review => review += 1,
+                    }
+                } else {
+                    new += 1;
+                }
+            }
+            FlashCardSource::Question { row, cloze, .. } => {
+                let q = app.get_question(row);
+                match card_phase(q.exam_by_cloze.get(cloze)) {
+                    FlashCardPhase::New => new += 1,
+                    FlashCardPhase::Learning => learning += 1,
+                    FlashCardPhase::Review => review += 1,
+                }
+            }
+        }
+    }
+    (new, learning, review)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FlashCardPhase {
+    New,
+    Learning,
+    Review,
+}
+
+fn card_phase(exam: Option<&ExamState>) -> FlashCardPhase {
+    match exam {
+        None => FlashCardPhase::New,
+        Some(ex) => {
+            if ex.stage == 0 {
+                FlashCardPhase::Learning
+            } else {
+                FlashCardPhase::Review
+            }
+        }
+    }
+}
+
+fn format_question_options(q: &Question) -> String {
+    if q.options.is_empty() {
+        String::new()
+    } else {
+        q.options
+            .iter()
+            .map(|o| format!("{}. {}", o.label, o.content))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn format_question_schedule(q: &Question) -> String {
+    if let Some(ex) = &q.exam {
+        let due = ex.due.as_deref().unwrap_or("-");
+        format!("stage:{} priority:{} due:{}", ex.stage, ex.priority, due)
+    } else {
+        "stage:? priority:? due:?".into()
+    }
+}
+
+fn wrap_flat_lines(lines: &[String], maxw: usize) -> (Vec<String>, Vec<usize>) {
+    let width = maxw.max(1);
+    let mut wrapped = Vec::new();
+    let mut counts = Vec::with_capacity(lines.len());
+    for line in lines {
+        let mut rows = 0;
+        let mut chunk = String::new();
+        let mut chunk_width = 0;
+        for ch in line.chars() {
+            let w = ch.width().unwrap_or(0);
+            if chunk_width + w > width && !chunk.is_empty() {
+                wrapped.push(chunk);
+                rows += 1;
+                chunk = String::new();
+                chunk_width = 0;
+            }
+            chunk.push(ch);
+            chunk_width += w;
+        }
+        if !chunk.is_empty() {
+            wrapped.push(chunk);
+            rows += 1;
+        } else if rows == 0 {
+            wrapped.push(String::new());
+            rows = 1;
+        }
+        counts.push(rows);
+    }
+    (wrapped, counts)
 }
 
 fn render_flat_text(lines: &mut Vec<Line>, app: &App) {
@@ -2214,6 +2548,16 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         segs.push(Span::styled(q, Style::default().fg(th.fg)));
         segs.push(Span::styled("_", Style::default().fg(th.accent)));
     }
+    if app.question_search_active {
+        let q = app
+            .question_search_query
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        segs.push(Span::styled("  /Q", Style::default().fg(th.muted)));
+        segs.push(Span::styled(q, Style::default().fg(th.fg)));
+        segs.push(Span::styled("_", Style::default().fg(th.accent)));
+    }
     let text = Line::from(segs);
     let para = Paragraph::new(text).style(Style::default().bg(th.bar_bg).fg(th.fg));
     f.render_widget(para, area);
@@ -2227,7 +2571,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(bg, area);
     let mut tips = String::from(" [q]退出  [j/k]上下  [1/2/3]来源  [a/A]答案  [c/C]评论  [z/x/g/v]Again/Hard/Good/Easy  [D]仅到期  [R]重载 ");
     tips.push_str(" | Text: [v/V]Visual/Line  [y]复制  [Ctrl+S]保存笔记 ");
-    tips.push_str(" | Notes: [/]搜索 [o]折叠 [Tab]切换 ");
+    tips.push_str(" | Questions/Notes: [/]搜索 [o]折叠 [Tab]切换  [S]Scraper ");
     tips.push_str(" | Flash: [F]进入/退出  [Space]揭示  [n/p]切换  [z/x/g/v]评分 ");
     let help = Paragraph::new(Line::from(vec![Span::styled(
         tips,
@@ -2371,6 +2715,7 @@ fn action_from_str(s: &str) -> Option<KeyAction> {
         "down_detail" => MoveDownDetail,
         "yank_to_note" => YankToNote,
         "toggle_notes_fold" => ToggleNotesFold,
+        "run_scraper" => RunScraper,
         _ => return None,
     })
 }
@@ -2392,6 +2737,7 @@ fn default_keymap() -> HashMap<char, KeyAction> {
     m.insert('x', GradeHard);
     m.insert('g', GradeGood);
     m.insert('v', GradeEasy);
+    m.insert('S', RunScraper); // 大写 S
     m.insert('D', ToggleDueOnly); // 大写 D
     m.insert('R', Reload); // 大写 R
                            // Visual 默认
@@ -2561,6 +2907,57 @@ fn note_matches_query(note: &Note, query: &str) -> bool {
     haystack.push('\n');
     haystack.push_str(&note.content);
     haystack.to_lowercase().contains(query)
+}
+
+fn refresh_question_filter(app: &mut App) {
+    let mut indices: Vec<usize> = (0..app.rows.len()).collect();
+    if app.question_search_active {
+        let query = app
+            .question_search_query
+            .as_ref()
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        if !query.is_empty() {
+            indices = app
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, rr)| question_matches(app, rr, &query))
+                .map(|(i, _)| i)
+                .collect();
+        }
+    }
+    if indices.is_empty() {
+        app.list_state.select(None);
+    } else {
+        let sel = app
+            .list_state
+            .selected()
+            .unwrap_or(0)
+            .min(indices.len() - 1);
+        app.list_state.select(Some(sel));
+    }
+    app.question_filtered_indices = indices;
+}
+
+fn question_matches(app: &App, rr: &RowRef, query: &str) -> bool {
+    let q = app.get_question(rr);
+    let mut hay = String::new();
+    hay.push_str(&q.content);
+    hay.push('\n');
+    hay.push_str(&q.analysis);
+    hay.push('\n');
+    hay.push_str(&q.answer.join(" "));
+    hay.push('\n');
+    for comment in &q.comments {
+        hay.push_str(comment);
+        hay.push('\n');
+    }
+    hay.to_lowercase().contains(query)
+}
+
+fn question_visible_count(app: &App) -> usize {
+    app.question_filtered_indices.len()
 }
 
 fn rebuild_note_view(app: &mut App) {
